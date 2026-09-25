@@ -1,0 +1,85 @@
+# Essence Browser — Chromium migration gates (shell-only, minutes).
+#
+# What runs here: textual migration gates + file validity. These catch
+# regressions (new Gecko calls, loader URLs, dead asset refs, bad JSON)
+# on every push without building anything.
+#
+# What does NOT run here: full chrome.exe builds (2-8 h + 100 GB).
+# Heavy builds belong on a self-hosted runner (200 GB+ SSD) or cloud VM
+# with remote execution — see PLAN.md and G:\Dx\CIRCLE_CI.md.
+
+version: 2.1
+
+jobs:
+  migration-gates:
+    docker:
+      - image: cimg/base:current
+    resource_class: medium
+    steps:
+      - checkout
+      - run:
+          name: Install ripgrep and python3
+          command: |
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep python3
+      - run:
+          name: Gate 1 — no Gecko APIs outside adapters/tests
+          command: |
+            HITS=$(rg -l 'Services\.|gBrowser\.|SessionStore\.|PlacesUtils\.|MozXULElement|createXULElement|ChromeUtils\.|XPCOMUtils\.' src/zen -g '!**/adapters/**' -g '!**/tests/**' -g '!**/@types/**' -g '!**/mochitests/**' || true)
+            if [ -n "$HITS" ]; then
+              echo "FAIL: Gecko API references outside adapters/:"
+              echo "$HITS"
+              exit 1
+            fi
+            echo "Gate 1 clean."
+      - run:
+          name: Gate 2 — no loader URLs or legacy CSS outside adapters/tests
+          command: |
+            HITS=$(rg -l 'chrome://|resource://|-moz-|@namespace|%include' src/zen -g '!**/adapters/**' -g '!**/tests/**' -g '!**/@types/**' -g '!**/mochitests/**' || true)
+            if [ -n "$HITS" ]; then
+              echo "FAIL: loader/legacy references outside adapters/:"
+              echo "$HITS"
+              exit 1
+            fi
+            echo "Gate 2 clean."
+      - run:
+          name: Gate 3 — no merge-conflict markers in src/zen
+          command: |
+            HITS=$(rg -l '^<{7} |^>{7} ' src/zen || true)
+            if [ -n "$HITS" ]; then
+              echo "FAIL: conflict markers in:"
+              echo "$HITS"
+              exit 1
+            fi
+            echo "Gate 3 clean."
+      - run:
+          name: "Gate 4 — dead asset refs must not grow (R1 ceiling: 54)"
+          command: |
+            COUNT=$(rg -c '\.\./assets/|\.\./styles/' src/zen -g '!**/tests/**' || true | awk -F: '{s+=$2} END {print s+0}')
+            echo "dead asset refs: $COUNT (ceiling 54)"
+            if [ "$COUNT" -gt 54 ]; then
+              echo "FAIL: new dead ../assets/ or ../styles/ references (R1 repair owns these)."
+              exit 1
+            fi
+      - run:
+          name: Config and mapping validity
+          command: |
+            python3 -c "import json; [json.load(open(f)) for f in ['surfer.json','engine-chromium/prefs.json','engine-chromium/policy/policy.json','package.json']]; print('json ok')"
+            test "$(python3 -c "import json; print(json.load(open('surfer.json'))['migration']['engine'])")" = "chromium"
+            echo "surfer.json engine=chromium ok."
+            ROWS=$(rg -c '^\| `' engine-chromium/patches-mapping.md)
+            PATCHES=$(find src/browser src/external-patches -name '*.patch' | wc -l)
+            echo "mapping rows: $ROWS, patch files: $PATCHES"
+            if [ "$ROWS" -lt "$PATCHES" ]; then
+              echo "FAIL: patches-mapping.md covers fewer patches than exist."
+              exit 1
+            fi
+
+workflows:
+  version: 2
+  migration:
+    jobs:
+      - migration-gates:
+          filters:
+            branches:
+              only: /.*/
